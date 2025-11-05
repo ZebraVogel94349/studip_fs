@@ -12,75 +12,101 @@ static size_t WriteToString(void* contents, size_t size, size_t nmemb, void* use
     return size * nmemb;
 }
 
-int main() {
-    const std::filesystem::path cookieFile = "cookies.txt";
+int response_parse_first_match(std::string re_string, std::string response, std::string& matched_string){
+    std::smatch match;
+    matched_string = "";
+    if (std::regex_search(response, match, std::regex(re_string)))
+        matched_string = match[1];
+    if(matched_string.empty()){
+        std::cerr << "failed parsing response: could not find " << re_string << std::endl;
+        return 1;
+    }
+    return 0;
+}
 
+int post(CURL*& curl, std::string url, std::string post_data, std::string& response){
+
+    curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
+    curl_easy_setopt(curl, CURLOPT_POST, 1L);
+    curl_easy_setopt(curl, CURLOPT_POSTFIELDS, post_data.c_str());
+    curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE, (long)post_data.size());
+    curl_easy_setopt(curl, CURLOPT_WRITEDATA, &response);
+
+    CURLcode res = curl_easy_perform(curl);
+    if (res != CURLE_OK){
+        std::cerr << "POST-Request failed " << url << std::endl;
+        return 1;
+    }
+    return 0;
+}
+
+int studip_login_init(CURL*& curl){
+    //delete cookies.txt if it exists
+    const std::filesystem::path cookieFile = "cookies.txt";
     try {
         if (std::filesystem::exists(cookieFile))
             std::filesystem::remove(cookieFile);
     } catch (const std::filesystem::filesystem_error& e) {
-        std::cerr << "Fehler beim Löschen: " << e.what() << '\n';
+        std::cerr << "Could not delete cookies.txt: " << e.what() << std::endl;
+        return 1;
     }
-
-    CURL* curl;
-    CURLcode res;
+    //initialize curl
     curl_global_init(CURL_GLOBAL_DEFAULT);
     curl = curl_easy_init();
 
     if (!curl) {
-        std::cerr << "Fehler: curl konnte nicht initialisiert werden.\n";
+        std::cerr << "Could not initialize curl." << std::endl; 
         return 1;
     }
-
-    // 1. Anfrage
-    const char* initial_url =
-        "https://studip.uni-hannover.de/Shibboleth.sso/Login?"
-        "target=https%3A%2F%2Fstudip.uni-hannover.de%2Fdispatch.php%2Flogin%3Fsso%3Dshib%26again%3Dyes%26cancel_login%3D1"
-        "&entityID=https%3A%2F%2Fsso.idm.uni-hannover.de%2Fidp%2Fshibboleth";
-
-    std::string initial_response;
-
-    curl_easy_setopt(curl, CURLOPT_URL, initial_url);
+    //set curl options
     curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
     curl_easy_setopt(curl, CURLOPT_COOKIEJAR, "cookies.txt");
     curl_easy_setopt(curl, CURLOPT_COOKIEFILE, "cookies.txt");
     curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, WriteToString);
+    curl_easy_setopt(curl, CURLOPT_ACCEPT_ENCODING, "");
+    return 0;
+}
+
+int studip_login(CURL*& curl, std::string username, std::string password){
+    CURLcode res;
+    
+    if(studip_login_init(curl)){
+        std::cerr << "Login initialization failed." << std::endl;
+        return 1;
+    }
+    
+    //first request
+    const char* initial_url =
+        "https://studip.uni-hannover.de/Shibboleth.sso/Login?"
+        "target=https%3A%2F%2Fstudip.uni-hannover.de%2Fdispatch.php%2Flogin%3Fsso%3Dshib%26again%3Dyes%26cancel_login%3D1"
+        "&entityID=https%3A%2F%2Fsso.idm.uni-hannover.de%2Fidp%2Fshibboleth";
+    std::string initial_response;
+
+    curl_easy_setopt(curl, CURLOPT_URL, initial_url);
     curl_easy_setopt(curl, CURLOPT_WRITEDATA, &initial_response);
-    curl_easy_setopt(curl, CURLOPT_ACCEPT_ENCODING, ""); // automatische Dekompression
 
     res = curl_easy_perform(curl);
     if (res != CURLE_OK) {
-        std::cerr << "Fehler bei erster Anfrage: " << curl_easy_strerror(res) << "\n";
-        curl_easy_cleanup(curl);
-        curl_global_cleanup();
+        std::cerr << "First request for login failed: " << curl_easy_strerror(res) << "\n";
         return 1;
     }
-
-    // 1. Parsen
-    std::smatch match;
-    std::regex action_re(R"(action\s*=\s*["']([^"']+)["'])");
-    std::regex token_re(R"(<input[^>]*name\s*=\s*["']csrf_token["'][^>]*value\s*=\s*["']([^"']+)["'])");
-
+    //parse first response
     std::string action_path;
+    if (response_parse_first_match(R"(action\s*=\s*["']([^"']+)["'])", initial_response, action_path)){
+        std::cerr << "Could not find action_path from first response." << std::endl;
+        return 1;
+    }
     std::string csrf_token;
-
-    if (std::regex_search(initial_response, match, action_re))
-        action_path = match[1];
-    if (std::regex_search(initial_response, match, token_re))
-        csrf_token = match[1];
-
-    if (action_path.empty() || csrf_token.empty()) {
-        std::cerr << "Fehler: Formular konnte nicht korrekt geparst werden.\n";
-        curl_easy_cleanup(curl);
-        curl_global_cleanup();
+    if (response_parse_first_match(R"(<input[^>]*name\s*=\s*["']csrf_token["'][^>]*value\s*=\s*["']([^"']+)["'])", initial_response, csrf_token)){
+        std::cerr << "Could not find csrf_token from first response." << std::endl;
         return 1;
     }
 
+    //second request
     std::string post_url;
     post_url = "https://sso.idm.uni-hannover.de" + action_path;
     char* escaped_token = curl_easy_escape(curl, csrf_token.c_str(), 0);
 
-    //2. Anfrage
     std::ostringstream post_fields;
     post_fields
         << "csrf_token=" << escaped_token
@@ -94,36 +120,16 @@ int main() {
         << "&_eventId_proceed=";
     curl_free(escaped_token);
 
-    std::string post_data = post_fields.str();
-
     std::string login_page_response;
+    post(curl, post_url, post_fields.str(), login_page_response);
 
-    curl_easy_setopt(curl, CURLOPT_URL, post_url.c_str());
-    curl_easy_setopt(curl, CURLOPT_POST, 1L);
-    curl_easy_setopt(curl, CURLOPT_POSTFIELDS, post_data.c_str());
-    curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE, (long)post_data.size());
-    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, WriteToString);
-    curl_easy_setopt(curl, CURLOPT_WRITEDATA, &login_page_response);
-
-    res = curl_easy_perform(curl);
-    if (res != CURLE_OK){
-        std::cerr << "Fehler bei zweiter Anfrage: " << curl_easy_strerror(res) << "\n";
+    //parse second response
+    if (response_parse_first_match(R"(action\s*=\s*["']([^"']+)["'])", login_page_response, action_path)){
+        std::cerr << "Could not find action_path from second response." << std::endl;
         return 1;
     }
-
-    //2. Parsen
-    action_path = "";
-    csrf_token = "";
-
-    if (std::regex_search(login_page_response, match, action_re))
-        action_path = match[1];
-    if (std::regex_search(login_page_response, match, token_re))
-        csrf_token = match[1];
-
-    if (action_path.empty() || csrf_token.empty()) {
-        std::cerr << "Fehler: Formular konnte nicht korrekt geparst werden.\n";
-        curl_easy_cleanup(curl);
-        curl_global_cleanup();
+    if (response_parse_first_match(R"(<input[^>]*name\s*=\s*["']csrf_token["'][^>]*value\s*=\s*["']([^"']+)["'])", login_page_response, csrf_token)){
+        std::cerr << "Could not find csrf_token from second response." << std::endl;
         return 1;
     }
 
@@ -131,42 +137,25 @@ int main() {
 
     escaped_token = curl_easy_escape(curl, csrf_token.c_str(), 0);
     
-    //3. Anfrage
+    //third request
     post_fields.str("");
     post_fields
         << "csrf_token=" << escaped_token
         << "&j_username=" << USERNAME << "&j_password=" << PASSWORD << "&_eventId_proceed=";
     curl_free(escaped_token);
 
-    post_data = post_fields.str();
-
     std::string logged_in_response;
+    post(curl, post_url, post_fields.str(), logged_in_response);
 
-    curl_easy_setopt(curl, CURLOPT_URL, post_url.c_str());
-    curl_easy_setopt(curl, CURLOPT_POST, 1L);
-    curl_easy_setopt(curl, CURLOPT_POSTFIELDS, post_data.c_str());
-    curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE, (long)post_data.size());
-    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, WriteToString);
-    curl_easy_setopt(curl, CURLOPT_WRITEDATA, &logged_in_response);
-
-    res = curl_easy_perform(curl);
-
-    //3. Parsen
-    std::regex relay_re(R"(name="RelayState"\s+value="([^"]+)\")");
-    std::regex saml_re(R"(name="SAMLResponse"\s+value="([^"]+)\")");
-
+    //parse third response
     std::string relay_state;
     std::string saml_response;
-    
-    if (std::regex_search(logged_in_response, match, relay_re))
-        relay_state = match[1];
-    if (std::regex_search(logged_in_response, match, saml_re))
-        saml_response = match[1];
-
-    if (relay_state.empty() || saml_response.empty()) {
-        std::cerr << "Fehler: Formular konnte nicht korrekt geparst werden.\n";
-        curl_easy_cleanup(curl);
-        curl_global_cleanup();
+    if (response_parse_first_match(R"(name="RelayState"\s+value="([^"]+)\")", logged_in_response, relay_state)){
+        std::cerr << "Could not find relay_state from third response." << std::endl;
+        return 1;
+    }
+    if (response_parse_first_match(R"(name="SAMLResponse"\s+value="([^"]+)\")", logged_in_response, saml_response)){
+        std::cerr << "Could not find saml_response from third response." << std::endl;
         return 1;
     }
     const std::string colon = "&#x3a;";
@@ -181,7 +170,7 @@ int main() {
         saml_response.replace(plus_pos, plus.length(), "%2B");
         plus_pos += 1;
     }
-    //4. Anfrage
+    //fourth request
 
     post_url = "https://studip.uni-hannover.de/Shibboleth.sso/SAML2/POST";
     post_fields.str("");
@@ -189,21 +178,21 @@ int main() {
         << "RelayState=" << relay_state
         << "&SAMLResponse=" << saml_response;
 
-    post_data = post_fields.str();
-    
     std::string studip_response;
-
-    curl_easy_setopt(curl, CURLOPT_URL, post_url.c_str());
-    curl_easy_setopt(curl, CURLOPT_POST, 1L);
-    curl_easy_setopt(curl, CURLOPT_POSTFIELDS, post_data.c_str());
-    curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE, (long)post_data.size());
-    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, WriteToString);
-    curl_easy_setopt(curl, CURLOPT_WRITEDATA, &studip_response);
-
-    res = curl_easy_perform(curl);
+    post(curl, post_url, post_fields.str(), studip_response);
     std::cout << studip_response;
+    return 0;
+}
 
+void cleanup(CURL*& curl){
     curl_easy_cleanup(curl);
     curl_global_cleanup();
+    return;
+}
+
+int main() {
+    CURL* curl;
+    studip_login(curl, USERNAME, PASSWORD);
+    cleanup(curl);
     return 0;
 }
