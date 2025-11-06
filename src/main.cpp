@@ -1,6 +1,6 @@
 #include <iostream>
+#include <random>
 #include <sstream>
-#include <fstream>
 #include <filesystem>
 #include <string>
 #include <regex>
@@ -40,7 +40,7 @@ int post(CURL*& curl, std::string url, std::string post_data, std::string& respo
     return 0;
 }
 
-int studip_login_init(CURL*& curl){
+int initialize_curl(CURL*& curl){
     //delete cookies.txt if it exists
     const std::filesystem::path cookieFile = "cookies.txt";
     try {
@@ -70,11 +70,6 @@ int studip_login_init(CURL*& curl){
 int studip_login(CURL*& curl, std::string username, std::string password){
     CURLcode res;
     
-    if(studip_login_init(curl)){
-        std::cerr << "Login initialization failed." << std::endl;
-        return 1;
-    }
-    
     //first request
     const char* initial_url =
         "https://studip.uni-hannover.de/Shibboleth.sso/Login?"
@@ -84,6 +79,7 @@ int studip_login(CURL*& curl, std::string username, std::string password){
 
     curl_easy_setopt(curl, CURLOPT_URL, initial_url);
     curl_easy_setopt(curl, CURLOPT_WRITEDATA, &initial_response);
+    curl_easy_setopt(curl, CURLOPT_POST, 0L);
 
     res = curl_easy_perform(curl);
     if (res != CURLE_OK) {
@@ -180,7 +176,34 @@ int studip_login(CURL*& curl, std::string username, std::string password){
 
     std::string studip_response;
     post(curl, post_url, post_fields.str(), studip_response);
-    std::cout << studip_response;
+    return 0;
+}
+
+int make_api_request(CURL*& curl, std::string route, std::string& result, int max_tries){
+    if(max_tries < 1){
+        std::cerr << "Reached maximum tries for API request and failed.";
+        return 1;
+    }
+    std::string api_url = "https://studip.uni-hannover.de/jsonapi.php/v1/" + route;
+    curl_easy_setopt(curl, CURLOPT_POST, 0L);
+    curl_easy_setopt(curl, CURLOPT_URL, api_url.c_str());
+    curl_easy_setopt(curl, CURLOPT_WRITEDATA, &result);
+
+    CURLcode res = curl_easy_perform(curl);
+    if (res != CURLE_OK){
+        std::cerr << "API request failed: " << curl_easy_strerror(res) << std::endl;
+        return 1;
+    }
+    long http_code = 0;
+    curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &http_code);
+    if (http_code == 401){
+        std::cerr << "API request failed because of missing authorization, trying to login..." << std::endl;
+        if(studip_login(curl, USERNAME, PASSWORD)){
+            std::cerr << "Login after unauthorized API request failed." << std::endl;
+            return 1;
+        }
+        make_api_request(curl, route, result, max_tries - 1);
+    }
     return 0;
 }
 
@@ -192,7 +215,14 @@ void cleanup(CURL*& curl){
 
 int main() {
     CURL* curl;
+    if(initialize_curl(curl)){
+        std::cerr << "Curl initialization failed." << std::endl;
+        return 1;
+    }
     studip_login(curl, USERNAME, PASSWORD);
+    std::string str;
+    make_api_request(curl, "users/me", str, 2);
+    std::cout << str;
     cleanup(curl);
     return 0;
 }
