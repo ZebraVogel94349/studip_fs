@@ -1,31 +1,44 @@
 #include <iostream>
-#include <random>
+#include <ostream>
 #include <sstream>
 #include <filesystem>
 #include <string>
 #include <regex>
 #include <curl/curl.h>
+#include <nlohmann/json.hpp>
+#include <vector>
+#include <set>
 #include "secrets/login.h"
+
+#define MAX_RESULTS 300
+
+class course {
+public:
+    std::string id;
+    std::string title;
+    std::string start_semester_url;
+    std::string folders_url;
+};
+
 
 static size_t WriteToString(void* contents, size_t size, size_t nmemb, void* userp) {
     ((std::string*)userp)->append((char*)contents, size * nmemb);
     return size * nmemb;
 }
 
-int response_parse_first_match(std::string re_string, std::string response, std::string& matched_string){
+int response_parse_first_match(const std::string& re_string, const std::string& response, std::string& matched_string){
     std::smatch match;
     matched_string = "";
     if (std::regex_search(response, match, std::regex(re_string)))
         matched_string = match[1];
-    if(matched_string.empty()){
-        std::cerr << "failed parsing response: could not find " << re_string << std::endl;
+    if (matched_string.empty()){
+        std::cerr << "Failed parsing response: could not find " << re_string << std::endl;
         return 1;
     }
     return 0;
 }
 
-int post(CURL*& curl, std::string url, std::string post_data, std::string& response){
-
+int post(CURL*& curl, const std::string& url, const std::string& post_data, std::string& response){
     curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
     curl_easy_setopt(curl, CURLOPT_POST, 1L);
     curl_easy_setopt(curl, CURLOPT_POSTFIELDS, post_data.c_str());
@@ -67,7 +80,7 @@ int initialize_curl(CURL*& curl){
     return 0;
 }
 
-int studip_login(CURL*& curl, std::string username, std::string password){
+int studip_login(CURL*& curl, const std::string& username, const std::string& password){
     CURLcode res;
     
     //first request
@@ -179,8 +192,8 @@ int studip_login(CURL*& curl, std::string username, std::string password){
     return 0;
 }
 
-int make_api_request(CURL*& curl, std::string route, std::string& result, int max_tries){
-    if(max_tries < 1){
+int make_api_request(CURL*& curl, const std::string& route, std::string& result, int max_tries){
+    if (max_tries < 1){
         std::cerr << "Reached maximum tries for API request and failed.";
         return 1;
     }
@@ -198,7 +211,7 @@ int make_api_request(CURL*& curl, std::string route, std::string& result, int ma
     curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &http_code);
     if (http_code == 401){
         std::cerr << "API request failed because of missing authorization, trying to login..." << std::endl;
-        if(studip_login(curl, USERNAME, PASSWORD)){
+        if (studip_login(curl, USERNAME, PASSWORD)){
             std::cerr << "Login after unauthorized API request failed." << std::endl;
             return 1;
         }
@@ -207,22 +220,151 @@ int make_api_request(CURL*& curl, std::string route, std::string& result, int ma
     return 0;
 }
 
+std::string remove_jsonapi_prefix(std::string str){
+     const std::string prefix = "/jsonapi.php/v1/";
+    if (str.rfind(prefix, 0) == 0)
+        return str.substr(prefix.size());
+    return str; 
+}
+
+int parse_json(const std::string& json, const std::string& field, std::string* result) {
+    try {
+        nlohmann::json parsed = nlohmann::json::parse(json);
+
+        nlohmann::json::json_pointer ptr(field);
+
+        if (!parsed.contains(ptr)){
+            std::cerr << "Could not find field " << field << " in JSON" << std::endl;
+            return 1;
+        }
+            
+        const nlohmann::basic_json<> value = parsed.at(ptr);
+
+        if (!value.is_string()) {
+            *result = value.dump();
+        }
+        else {
+            *result = value.get<std::string>();
+        }
+        return 0;
+    }
+    catch (const nlohmann::json::parse_error& e) {
+        std::cerr << "Could not parse JSON: " << e.what() << std::endl;
+        return 1;
+    }
+    return 1;
+}
+
 void cleanup(CURL*& curl){
     curl_easy_cleanup(curl);
     curl_global_cleanup();
     return;
 }
 
+int find_courses_route(CURL*& curl, std::string& route){
+    std::string users_me;
+    if (make_api_request(curl, "users/me", users_me, 2)){
+        std::cerr << "User info request failed." << std::endl;
+        return 1;
+    }
+    std::string courses_field;
+    if (parse_json(users_me, "/data/relationships/courses/links/related", &courses_field)){
+        std::cerr << "Failed to find courses because of JSON error." << std::endl;
+    }
+    std::ostringstream courses_route;
+    courses_route << remove_jsonapi_prefix(courses_field) << "?page%5Boffset%5D=0&page%5Blimit%5D=" << MAX_RESULTS;
+    route = courses_route.str();
+    return 0;
+}
+
+int list_courses(CURL*& curl, const std::string& route, std::vector<course>& courses, std::set<std::string> semesters){
+    std::string courses_json;
+    if (make_api_request(curl, route, courses_json, 2)){
+        std::cerr << "Request to list courses failed." << std::endl;
+        return 1;
+    }
+
+    //keep track of title/semester-combinations to rename duplicates
+    std::map<std::pair<std::string, std::string>, int> seen;
+
+    try {
+        nlohmann::json parsed = nlohmann::json::parse(courses_json);
+        if (!parsed.contains("data")) {
+            std::cerr << "Courses response does not have data field" << std::endl;
+            return 1;
+        }
+        const nlohmann::json& data = parsed["data"];
+
+        for (auto it = data.begin(); it != data.end(); ++it) {
+            const nlohmann::json& item = it.value();
+            course c;
+
+            //title
+            try {
+                c.title = item.at("attributes").at("title").get<std::string>();
+            } catch (...) {
+                c.title = "";
+            }
+
+            //start-semester
+            try {
+                c.start_semester_url = remove_jsonapi_prefix(item.at("relationships").at("start-semester").at("links").at("related").get<std::string>());
+                semesters.insert(c.start_semester_url);
+            } catch (...) {
+                c.start_semester_url = "";
+            }
+
+            //folders
+            try {
+                c.folders_url = remove_jsonapi_prefix(item.at("relationships").at("folders").at("links").at("related").get<std::string>());
+            } catch (...) {
+                c.folders_url.clear();
+            }
+
+            if (c.title.empty() || c.start_semester_url.empty() || c.folders_url.empty()) {
+                std::cerr << "Course had invalid data." << std::endl;
+                continue;
+            }
+
+            //detect duplicates and rename them
+            auto key = std::make_pair(c.start_semester_url, c.title);
+            auto [pos, inserted] = seen.insert({key, 1});
+            if (!inserted) {
+                pos->second++;
+                c.title += " (" + std::to_string(pos->second) + ")";
+            }
+            courses.push_back(c);
+        }
+        return 0;
+    }
+    catch (const nlohmann::json::parse_error& e) {
+        std::cerr << "Could not parse courses JSON: " << e.what() << std::endl;
+        return 1;
+    }
+}
+
 int main() {
     CURL* curl;
-    if(initialize_curl(curl)){
+    if (initialize_curl(curl)){
         std::cerr << "Curl initialization failed." << std::endl;
         return 1;
     }
     studip_login(curl, USERNAME, PASSWORD);
-    std::string str;
-    make_api_request(curl, "users/me", str, 2);
-    std::cout << str;
+    std::string courses_route;
+    if (find_courses_route(curl, courses_route)){
+        std::cerr << "Could not find courses URL." << std::endl;
+        return 1;
+    }
+    std::vector<course> courses;
+    std::set<std::string> semesters;
+    if (list_courses(curl, courses_route, courses, semesters)){
+        std::cerr << "Could not parse courses." << std::endl;
+        return 1;
+    }
+    for (course c : courses){
+        std::cout << c.title << std::endl;
+    }
+    
     cleanup(curl);
     return 0;
 }
