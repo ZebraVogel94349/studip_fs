@@ -9,6 +9,8 @@ find_package(CURL REQUIRED)
 find_package(PkgConfig REQUIRED)
 pkg_check_modules(FUSE3 REQUIRED fuse3)
 
+set(CMAKE_CXX_STANDARD 20)
+
 add_executable(studip_fs src/main.cpp)
 
 target_link_libraries(studip_fs PRIVATE CURL::libcurl)

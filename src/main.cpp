@@ -1,3 +1,5 @@
+#define FUSE_USE_VERSION 35
+#include <fuse3/fuse.h>
 #include <algorithm>
 #include <iostream>
 #include <ostream>
@@ -9,9 +11,13 @@
 #include <nlohmann/json.hpp>
 #include <vector>
 #include <set>
+#include <mutex>
 #include "secrets/login.h"
 
 #define MAX_RESULTS 300
+
+static std::map<std::string, std::vector<std::string>> fs_structure;
+static std::mutex reload_mutex;
 
 class course {
 public:
@@ -63,8 +69,8 @@ int initialize_curl(CURL*& curl){
     }
     //set curl options
     curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
-    curl_easy_setopt(curl, CURLOPT_COOKIEJAR, "cookies.txt");
-    curl_easy_setopt(curl, CURLOPT_COOKIEFILE, "cookies.txt");
+    curl_easy_setopt(curl, CURLOPT_COOKIEJAR, "/tmp/studcookies.txt");
+    curl_easy_setopt(curl, CURLOPT_COOKIEFILE, "/tmp/studcookies.txt");
     curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, WriteToString);
     curl_easy_setopt(curl, CURLOPT_ACCEPT_ENCODING, "");
     return 0;
@@ -72,13 +78,13 @@ int initialize_curl(CURL*& curl){
 
 int studip_login(CURL*& curl, const std::string& username, const std::string& password){
 
-    //delete cookies.txt if it exists
-    const std::filesystem::path cookieFile = "cookies.txt";
+    //delete studcookies.txt if it exists
+    const std::filesystem::path cookieFile = "/tmp/studcookies.txt";
     try {
         if (std::filesystem::exists(cookieFile))
             std::filesystem::remove(cookieFile);
     } catch (const std::filesystem::filesystem_error& e) {
-        std::cerr << "Could not delete cookies.txt: " << e.what() << std::endl;
+        std::cerr << "Could not delete studcookies.txt: " << e.what() << std::endl;
         return 1;
     }
 
@@ -256,12 +262,6 @@ int parse_json(const std::string& json, const std::string& field, std::string* r
     return 1;
 }
 
-void cleanup(CURL*& curl){
-    curl_easy_cleanup(curl);
-    curl_global_cleanup();
-    return;
-}
-
 int find_courses_route(CURL*& curl, std::string& route){
     std::string users_me;
     if (make_api_request(curl, "users/me", users_me, 2)){
@@ -346,6 +346,117 @@ int list_courses(CURL*& curl, const std::string& route, std::vector<course>& cou
     }
 }
 
+int reload_fs_structure() {
+    std::lock_guard<std::mutex> lock(reload_mutex);
+
+    CURL* curl;
+    if (initialize_curl(curl)){
+        std::cerr << "Curl initialization failed." << std::endl;
+        return 1;
+    }
+
+    std::string courses_route;
+    if (find_courses_route(curl, courses_route)){
+        std::cerr << "Could not find courses URL during reload." << std::endl;
+        curl_easy_cleanup(curl);
+        return 1;
+    }
+    std::vector<course> courses;
+    std::set<std::string> semesters;
+    if (list_courses(curl, courses_route, courses, semesters)){
+        std::cerr << "Could not parse courses during reload." << std::endl;
+        curl_easy_cleanup(curl);
+        return 1;
+    }
+    std::map<std::string, std::string> semesters_map;
+    for (const std::string &semester_route : semesters){
+        std::string semester_json;
+        if (make_api_request(curl, semester_route, semester_json, 2)){
+            std::cerr << "Semester request failed during reload." << std::endl;
+            curl_easy_cleanup(curl);
+            return 1;
+        }
+        std::string semester_title;
+        if (parse_json(semester_json, "/data/attributes/title", &semester_title)){
+            std::cerr << "Failed to find semester name during reload." << std::endl;
+            curl_easy_cleanup(curl);
+            return 1;
+        }
+        //remove '/' from folder names
+        std::replace(semester_title.begin(), semester_title.end(), '/', '-');
+        semesters_map.insert({semester_route, semester_title});
+    }
+
+    std::map<std::string, std::vector<std::string>> new_structure;
+    for (const auto &c : courses) {
+        std::string sem_title = semesters_map[c.start_semester_url];
+        new_structure[sem_title].push_back(c.title);
+    }
+    fs_structure.swap(new_structure);
+
+    curl_easy_cleanup(curl);
+    return 0;
+}
+
+static int fs_getattr(const char *path, struct stat *stbuf, struct fuse_file_info *) {
+    memset(stbuf, 0, sizeof(struct stat));
+    if (strcmp(path, "/") == 0) {
+        stbuf->st_mode = S_IFDIR | 0555;
+        stbuf->st_nlink = 2;
+        return 0;
+    }
+
+    std::string p(path + 1);
+    if (fs_structure.contains(p)) {
+        stbuf->st_mode = S_IFDIR | 0555;
+        stbuf->st_nlink = 2;
+        return 0;
+    }
+
+    for (const auto &pair : fs_structure) {
+        for (const auto &course : pair.second) {
+            if (p == pair.first + "/" + course) {
+                stbuf->st_mode = S_IFDIR | 0555;
+                stbuf->st_nlink = 2;
+                return 0;
+            }
+        }
+    }
+
+    return -ENOENT;
+}
+
+static int fs_readdir(const char *path, void *buf, fuse_fill_dir_t filler, off_t, struct fuse_file_info *, enum fuse_readdir_flags) {
+    if (reload_fs_structure()) {
+        return -EIO;
+    }
+
+    filler(buf, ".", nullptr, 0, (fuse_fill_dir_flags)0);
+    filler(buf, "..", nullptr, 0, (fuse_fill_dir_flags)0);
+
+    std::string p(path + 1);
+    if (strcmp(path, "/") == 0) {
+        for (const auto &pair : fs_structure)
+            filler(buf, pair.first.c_str(), nullptr, 0, (fuse_fill_dir_flags)0);
+        return 0;
+    }
+
+    auto it = fs_structure.find(p);
+    if (it != fs_structure.end()) {
+        for (const auto &course : it->second)
+            filler(buf, course.c_str(), nullptr, 0, (fuse_fill_dir_flags)0);
+        return 0;
+    }
+
+    return -ENOENT;
+}
+
+static const struct fuse_operations fs_ops = {
+    .getattr = fs_getattr,
+    .readdir = fs_readdir,
+};
+
+
 int main() {
     CURL* curl;
     if (initialize_curl(curl)){
@@ -353,36 +464,10 @@ int main() {
         return 1;
     }
     studip_login(curl, USERNAME, PASSWORD);
-    std::string courses_route;
-    if (find_courses_route(curl, courses_route)){
-        std::cerr << "Could not find courses URL." << std::endl;
-        return 1;
-    }
-    std::vector<course> courses;
-    std::set<std::string> semesters;
-    if (list_courses(curl, courses_route, courses, semesters)){
-        std::cerr << "Could not parse courses." << std::endl;
-        return 1;
-    }
-    std::map<std::string, std::string> semesters_map;
-    for (std::string semester_route : semesters){
-        std::string semester_json;
-        if (make_api_request(curl, semester_route, semester_json, 2)){
-            std::cerr << "Semester request failed." << std::endl;
-            return 1;
-        }
-        std::string semester_title;
-        if (parse_json(semester_json, "/data/attributes/title", &semester_title)){
-            std::cerr << "Failed to find semester name because of JSON error." << std::endl;
-            return 1;
-        }
-        std::replace(semester_title.begin(), semester_title.end(), '/', '-');
-        semesters_map.insert({semester_route, semester_title});
-    }
-    for (course c : courses){
-        std::cout << semesters_map[c.start_semester_url] << "/" << c.title << std::endl;
-    }
-    
-    cleanup(curl);
-    return 0;
+
+    curl_easy_cleanup(curl);
+
+    int fuse_argc = 2;
+    char *fuse_argv[] = { (char*)"studip_fs", (char*)"test", nullptr };
+    return fuse_main(fuse_argc, fuse_argv, &fs_ops, nullptr);
 }
