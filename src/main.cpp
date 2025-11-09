@@ -1,3 +1,4 @@
+#include <algorithm>
 #include <iostream>
 #include <ostream>
 #include <sstream>
@@ -14,7 +15,6 @@
 
 class course {
 public:
-    std::string id;
     std::string title;
     std::string start_semester_url;
     std::string folders_url;
@@ -54,16 +54,6 @@ int post(CURL*& curl, const std::string& url, const std::string& post_data, std:
 }
 
 int initialize_curl(CURL*& curl){
-    //delete cookies.txt if it exists
-    const std::filesystem::path cookieFile = "cookies.txt";
-    try {
-        if (std::filesystem::exists(cookieFile))
-            std::filesystem::remove(cookieFile);
-    } catch (const std::filesystem::filesystem_error& e) {
-        std::cerr << "Could not delete cookies.txt: " << e.what() << std::endl;
-        return 1;
-    }
-    //initialize curl
     curl_global_init(CURL_GLOBAL_DEFAULT);
     curl = curl_easy_init();
 
@@ -81,6 +71,17 @@ int initialize_curl(CURL*& curl){
 }
 
 int studip_login(CURL*& curl, const std::string& username, const std::string& password){
+
+    //delete cookies.txt if it exists
+    const std::filesystem::path cookieFile = "cookies.txt";
+    try {
+        if (std::filesystem::exists(cookieFile))
+            std::filesystem::remove(cookieFile);
+    } catch (const std::filesystem::filesystem_error& e) {
+        std::cerr << "Could not delete cookies.txt: " << e.what() << std::endl;
+        return 1;
+    }
+
     CURLcode res;
     
     //first request
@@ -270,6 +271,7 @@ int find_courses_route(CURL*& curl, std::string& route){
     std::string courses_field;
     if (parse_json(users_me, "/data/relationships/courses/links/related", &courses_field)){
         std::cerr << "Failed to find courses because of JSON error." << std::endl;
+        return 1;
     }
     std::ostringstream courses_route;
     courses_route << remove_jsonapi_prefix(courses_field) << "?page%5Boffset%5D=0&page%5Blimit%5D=" << MAX_RESULTS;
@@ -277,7 +279,7 @@ int find_courses_route(CURL*& curl, std::string& route){
     return 0;
 }
 
-int list_courses(CURL*& curl, const std::string& route, std::vector<course>& courses, std::set<std::string> semesters){
+int list_courses(CURL*& curl, const std::string& route, std::vector<course>& courses, std::set<std::string>& semesters){
     std::string courses_json;
     if (make_api_request(curl, route, courses_json, 2)){
         std::cerr << "Request to list courses failed." << std::endl;
@@ -326,6 +328,7 @@ int list_courses(CURL*& curl, const std::string& route, std::vector<course>& cou
                 continue;
             }
 
+            std::replace(c.title.begin(), c.title.end(), '/', '-');
             //detect duplicates and rename them
             auto key = std::make_pair(c.start_semester_url, c.title);
             auto [pos, inserted] = seen.insert({key, 1});
@@ -361,8 +364,23 @@ int main() {
         std::cerr << "Could not parse courses." << std::endl;
         return 1;
     }
+    std::map<std::string, std::string> semesters_map;
+    for (std::string semester_route : semesters){
+        std::string semester_json;
+        if (make_api_request(curl, semester_route, semester_json, 2)){
+            std::cerr << "Semester request failed." << std::endl;
+            return 1;
+        }
+        std::string semester_title;
+        if (parse_json(semester_json, "/data/attributes/title", &semester_title)){
+            std::cerr << "Failed to find semester name because of JSON error." << std::endl;
+            return 1;
+        }
+        std::replace(semester_title.begin(), semester_title.end(), '/', '-');
+        semesters_map.insert({semester_route, semester_title});
+    }
     for (course c : courses){
-        std::cout << c.title << std::endl;
+        std::cout << semesters_map[c.start_semester_url] << "/" << c.title << std::endl;
     }
     
     cleanup(curl);
