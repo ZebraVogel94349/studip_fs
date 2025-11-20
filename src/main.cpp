@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <iostream>
 #include <ostream>
+#include <fstream>
 #include <sstream>
 #include <filesystem>
 #include <string>
@@ -18,6 +19,8 @@
 
 static std::map<std::string, std::vector<std::string>> fs_structure;
 static std::mutex reload_mutex;
+
+static std::ofstream debug_out;
 
 class course {
 public:
@@ -38,7 +41,7 @@ int response_parse_first_match(const std::string& re_string, const std::string& 
     if (std::regex_search(response, match, std::regex(re_string)))
         matched_string = match[1];
     if (matched_string.empty()){
-        std::cerr << "Failed parsing response: could not find " << re_string << std::endl;
+        debug_out << "Failed parsing response: could not find " << re_string << std::endl;
         return 1;
     }
     return 0;
@@ -53,7 +56,7 @@ int post(CURL*& curl, const std::string& url, const std::string& post_data, std:
 
     CURLcode res = curl_easy_perform(curl);
     if (res != CURLE_OK){
-        std::cerr << "POST-Request failed " << url << std::endl;
+        debug_out << "POST-Request failed " << url << std::endl;
         return 1;
     }
     return 0;
@@ -64,7 +67,7 @@ int initialize_curl(CURL*& curl){
     curl = curl_easy_init();
 
     if (!curl) {
-        std::cerr << "Could not initialize curl." << std::endl; 
+        debug_out << "Could not initialize curl." << std::endl; 
         return 1;
     }
     //set curl options
@@ -84,7 +87,7 @@ int studip_login(CURL*& curl, const std::string& username, const std::string& pa
         if (std::filesystem::exists(cookieFile))
             std::filesystem::remove(cookieFile);
     } catch (const std::filesystem::filesystem_error& e) {
-        std::cerr << "Could not delete studcookies.txt: " << e.what() << std::endl;
+        debug_out << "Could not delete studcookies.txt: " << e.what() << std::endl;
         return 1;
     }
 
@@ -103,18 +106,18 @@ int studip_login(CURL*& curl, const std::string& username, const std::string& pa
 
     res = curl_easy_perform(curl);
     if (res != CURLE_OK) {
-        std::cerr << "First request for login failed: " << curl_easy_strerror(res) << "\n";
+        debug_out << "First request for login failed: " << curl_easy_strerror(res) << "\n";
         return 1;
     }
     //parse first response
     std::string action_path;
     if (response_parse_first_match(R"(action\s*=\s*["']([^"']+)["'])", initial_response, action_path)){
-        std::cerr << "Could not find action_path from first response." << std::endl;
+        debug_out << "Could not find action_path from first response." << std::endl;
         return 1;
     }
     std::string csrf_token;
     if (response_parse_first_match(R"(<input[^>]*name\s*=\s*["']csrf_token["'][^>]*value\s*=\s*["']([^"']+)["'])", initial_response, csrf_token)){
-        std::cerr << "Could not find csrf_token from first response." << std::endl;
+        debug_out << "Could not find csrf_token from first response." << std::endl;
         return 1;
     }
 
@@ -141,11 +144,11 @@ int studip_login(CURL*& curl, const std::string& username, const std::string& pa
 
     //parse second response
     if (response_parse_first_match(R"(action\s*=\s*["']([^"']+)["'])", login_page_response, action_path)){
-        std::cerr << "Could not find action_path from second response." << std::endl;
+        debug_out << "Could not find action_path from second response." << std::endl;
         return 1;
     }
     if (response_parse_first_match(R"(<input[^>]*name\s*=\s*["']csrf_token["'][^>]*value\s*=\s*["']([^"']+)["'])", login_page_response, csrf_token)){
-        std::cerr << "Could not find csrf_token from second response." << std::endl;
+        debug_out << "Could not find csrf_token from second response." << std::endl;
         return 1;
     }
 
@@ -167,11 +170,11 @@ int studip_login(CURL*& curl, const std::string& username, const std::string& pa
     std::string relay_state;
     std::string saml_response;
     if (response_parse_first_match(R"(name="RelayState"\s+value="([^"]+)\")", logged_in_response, relay_state)){
-        std::cerr << "Could not find relay_state from third response." << std::endl;
+        debug_out << "Could not find relay_state from third response." << std::endl;
         return 1;
     }
     if (response_parse_first_match(R"(name="SAMLResponse"\s+value="([^"]+)\")", logged_in_response, saml_response)){
-        std::cerr << "Could not find saml_response from third response." << std::endl;
+        debug_out << "Could not find saml_response from third response." << std::endl;
         return 1;
     }
     const std::string colon = "&#x3a;";
@@ -201,7 +204,7 @@ int studip_login(CURL*& curl, const std::string& username, const std::string& pa
 
 int make_api_request(CURL*& curl, const std::string& route, std::string& result, int max_tries){
     if (max_tries < 1){
-        std::cerr << "Reached maximum tries for API request and failed.";
+        debug_out << "Reached maximum tries for API request and failed.";
         return 1;
     }
     std::string api_url = "https://studip.uni-hannover.de/jsonapi.php/v1/" + route;
@@ -211,15 +214,15 @@ int make_api_request(CURL*& curl, const std::string& route, std::string& result,
 
     CURLcode res = curl_easy_perform(curl);
     if (res != CURLE_OK){
-        std::cerr << "API request failed: " << curl_easy_strerror(res) << std::endl;
+        debug_out << "API request failed: " << curl_easy_strerror(res) << std::endl;
         return 1;
     }
     long http_code = 0;
     curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &http_code);
     if (http_code == 401){
-        std::cerr << "API request failed because of missing authorization, trying to login..." << std::endl;
+        debug_out << "API request failed because of missing authorization, trying to login..." << std::endl;
         if (studip_login(curl, USERNAME, PASSWORD)){
-            std::cerr << "Login after unauthorized API request failed." << std::endl;
+            debug_out << "Login after unauthorized API request failed." << std::endl;
             return 1;
         }
         make_api_request(curl, route, result, max_tries - 1);
@@ -241,7 +244,7 @@ int parse_json(const std::string& json, const std::string& field, std::string* r
         nlohmann::json::json_pointer ptr(field);
 
         if (!parsed.contains(ptr)){
-            std::cerr << "Could not find field " << field << " in JSON" << std::endl;
+            debug_out << "Could not find field " << field << " in JSON" << std::endl;
             return 1;
         }
             
@@ -256,7 +259,7 @@ int parse_json(const std::string& json, const std::string& field, std::string* r
         return 0;
     }
     catch (const nlohmann::json::parse_error& e) {
-        std::cerr << "Could not parse JSON: " << e.what() << std::endl;
+        debug_out << "Could not parse JSON: " << e.what() << std::endl;
         return 1;
     }
     return 1;
@@ -265,12 +268,12 @@ int parse_json(const std::string& json, const std::string& field, std::string* r
 int find_courses_route(CURL*& curl, std::string& route){
     std::string users_me;
     if (make_api_request(curl, "users/me", users_me, 2)){
-        std::cerr << "User info request failed." << std::endl;
+        debug_out << "User info request failed." << std::endl;
         return 1;
     }
     std::string courses_field;
     if (parse_json(users_me, "/data/relationships/courses/links/related", &courses_field)){
-        std::cerr << "Failed to find courses because of JSON error." << std::endl;
+        debug_out << "Failed to find courses because of JSON error." << std::endl;
         return 1;
     }
     std::ostringstream courses_route;
@@ -282,7 +285,7 @@ int find_courses_route(CURL*& curl, std::string& route){
 int list_courses(CURL*& curl, const std::string& route, std::vector<course>& courses, std::set<std::string>& semesters){
     std::string courses_json;
     if (make_api_request(curl, route, courses_json, 2)){
-        std::cerr << "Request to list courses failed." << std::endl;
+        debug_out << "Request to list courses failed." << std::endl;
         return 1;
     }
 
@@ -292,7 +295,7 @@ int list_courses(CURL*& curl, const std::string& route, std::vector<course>& cou
     try {
         nlohmann::json parsed = nlohmann::json::parse(courses_json);
         if (!parsed.contains("data")) {
-            std::cerr << "Courses response does not have data field" << std::endl;
+            debug_out << "Courses response does not have data field" << std::endl;
             return 1;
         }
         const nlohmann::json& data = parsed["data"];
@@ -324,7 +327,7 @@ int list_courses(CURL*& curl, const std::string& route, std::vector<course>& cou
             }
 
             if (c.title.empty() || c.start_semester_url.empty() || c.folders_url.empty()) {
-                std::cerr << "Course had invalid data." << std::endl;
+                debug_out << "Course had invalid data." << std::endl;
                 continue;
             }
 
@@ -341,7 +344,7 @@ int list_courses(CURL*& curl, const std::string& route, std::vector<course>& cou
         return 0;
     }
     catch (const nlohmann::json::parse_error& e) {
-        std::cerr << "Could not parse courses JSON: " << e.what() << std::endl;
+        debug_out << "Could not parse courses JSON: " << e.what() << std::endl;
         return 1;
     }
 }
@@ -351,20 +354,20 @@ int reload_fs_structure() {
 
     CURL* curl;
     if (initialize_curl(curl)){
-        std::cerr << "Curl initialization failed." << std::endl;
+        debug_out << "Curl initialization failed." << std::endl;
         return 1;
     }
 
     std::string courses_route;
     if (find_courses_route(curl, courses_route)){
-        std::cerr << "Could not find courses URL during reload." << std::endl;
+        debug_out << "Could not find courses URL during reload." << std::endl;
         curl_easy_cleanup(curl);
         return 1;
     }
     std::vector<course> courses;
     std::set<std::string> semesters;
     if (list_courses(curl, courses_route, courses, semesters)){
-        std::cerr << "Could not parse courses during reload." << std::endl;
+        debug_out << "Could not parse courses during reload." << std::endl;
         curl_easy_cleanup(curl);
         return 1;
     }
@@ -372,13 +375,13 @@ int reload_fs_structure() {
     for (const std::string &semester_route : semesters){
         std::string semester_json;
         if (make_api_request(curl, semester_route, semester_json, 2)){
-            std::cerr << "Semester request failed during reload." << std::endl;
+            debug_out << "Semester request failed during reload." << std::endl;
             curl_easy_cleanup(curl);
             return 1;
         }
         std::string semester_title;
         if (parse_json(semester_json, "/data/attributes/title", &semester_title)){
-            std::cerr << "Failed to find semester name during reload." << std::endl;
+            debug_out << "Failed to find semester name during reload." << std::endl;
             curl_easy_cleanup(curl);
             return 1;
         }
@@ -443,8 +446,9 @@ static int fs_readdir(const char *path, void *buf, fuse_fill_dir_t filler, off_t
 
     auto it = fs_structure.find(p);
     if (it != fs_structure.end()) {
-        for (const auto &course : it->second)
+        for (const auto &course : it->second){
             filler(buf, course.c_str(), nullptr, 0, (fuse_fill_dir_flags)0);
+        }     
         return 0;
     }
 
@@ -459,8 +463,9 @@ static const struct fuse_operations fs_ops = {
 
 int main() {
     CURL* curl;
+    debug_out.open("/tmp/studdebug_out.txt", std::ios_base::app);
     if (initialize_curl(curl)){
-        std::cerr << "Curl initialization failed." << std::endl;
+        debug_out << "Curl initialization failed." << std::endl;
         return 1;
     }
     studip_login(curl, USERNAME, PASSWORD);
@@ -469,5 +474,9 @@ int main() {
 
     int fuse_argc = 2;
     char *fuse_argv[] = { (char*)"studip_fs", (char*)"test", nullptr };
-    return fuse_main(fuse_argc, fuse_argv, &fs_ops, nullptr);
+
+    int ret = fuse_main(fuse_argc, fuse_argv, &fs_ops, nullptr);
+
+    debug_out.close();
+    return ret;
 }
