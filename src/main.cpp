@@ -9,13 +9,34 @@
 #include <map>
 #include <set>
 #include <mutex>
+#include <condition_variable>
 #include <shared_mutex>
 #include <thread>
+#include <list>
 #include "secrets/login.h"
 
 const std::size_t PAGE_LIMIT = 100;
 const time_t TREE_CACHE = 300;
 const int REQUEST_DELAY = 100;
+const long REQUEST_TIMEOUT = 30;
+const double CHUNK_SIZE_FRACTION = 0.2;
+const std::size_t MIN_CHUNK_SIZE = 256 * 1024;
+const std::size_t MAX_CHUNK_SIZE = 4 * 1024 * 1024;
+const std::size_t MAX_CACHE_BYTES = 800 * 1024 * 1024;
+const char* COOKIE_FILE_PATH = "/tmp/studcookies.txt";
+const char* STUDIP_BASE_URL = "https://studip.uni-hannover.de";
+const char* STUDIP_JSONAPI_PREFIX = "/jsonapi.php/v1/";
+const char* STUDIP_JSONAPI_URL = "https://studip.uni-hannover.de/jsonapi.php/v1/";
+const char* SSO_BASE_URL = "https://sso.idm.uni-hannover.de";
+const char* STUDIP_SAML_POST_URL = "https://studip.uni-hannover.de/Shibboleth.sso/SAML2/POST";
+const char* SHIBBOLETH_LOGIN_URL =
+    "https://studip.uni-hannover.de/Shibboleth.sso/Login?"
+    "target=https%3A%2F%2Fstudip.uni-hannover.de%2Fdispatch.php%2Flogin%3Fsso%3Dshib%26again%3Dyes%26cancel_login%3D1"
+    "&entityID=https%3A%2F%2Fsso.idm.uni-hannover.de%2Fidp%2Fshibboleth";
+const char* ACTION_REGEX = R"(action\s*=\s*["']([^"']+)["'])";
+const char* CSRF_REGEX = R"(<input[^>]*name\s*=\s*["']csrf_token["'][^>]*value\s*=\s*["']([^"']+)["'])";
+const char* RELAY_STATE_REGEX = R"(name="RelayState"\s+value="([^"]+)\")";
+const char* SAML_RESPONSE_REGEX = R"(name="SAMLResponse"\s+value="([^"]+)\")";
 
 struct file_entry {
     std::string name;
@@ -43,12 +64,47 @@ struct course {
     std::string folders_url;
 };
 
+using lru_key = std::pair<std::string, std::size_t>;
+
+struct cached_chunk {
+    std::string data;
+    std::list<lru_key>::iterator lru_it;
+};
+
+struct file_cache {
+    std::string download_url;
+    std::map<std::size_t, cached_chunk> chunks;
+    std::set<std::size_t> downloading;
+};
+
 folder fs_root;
 std::shared_mutex fs_mutex;
+std::mutex cache_mutex;
+std::condition_variable cache_cv;
 std::mutex curl_mutex;
 std::mutex login_mutex;
 std::ofstream debug_out;
 CURL* curl;
+std::size_t cached_bytes = 0;
+std::map<std::string, file_cache> file_caches;
+std::list<lru_key> lru_list;
+
+static std::size_t compute_cache_chunk_size_locked(file_cache& cache, const file_entry& file) {
+    double scaled = static_cast<double>(file.size) * CHUNK_SIZE_FRACTION;
+    double min_size = static_cast<double>(MIN_CHUNK_SIZE);
+    double max_size = static_cast<double>(MAX_CHUNK_SIZE);
+    scaled += 10.0;
+    if (scaled < min_size)
+        scaled = min_size;
+    if (scaled > max_size)
+        scaled = max_size;
+    return static_cast<std::size_t>(scaled);
+}
+
+static std::size_t get_cache_chunk_size(const std::string& path, const file_entry& file) {
+    std::lock_guard<std::mutex> lock(cache_mutex);
+    return compute_cache_chunk_size_locked(file_caches[path], file);
+}
 
 static int log_err(const std::string& msg) {
     debug_out << msg << std::endl;
@@ -60,7 +116,15 @@ size_t WriteToString(void* contents, size_t size, size_t nmemb, void* userp) {
     return size * nmemb;
 }
 
-int serial_curl_request(const std::string& url, void* writedata, long post = 0L, const char* postfields = nullptr, long postfieldsize = 0L, long* http_code = nullptr){
+int serial_curl_request(
+    const std::string& url,
+    void* writedata,
+    long post = 0L,
+    const char* postfields = nullptr,
+    long postfieldsize = 0L,
+    long* http_code = nullptr,
+    const char* range = nullptr){
+
     std::lock_guard<std::mutex> lock(curl_mutex);
     std::this_thread::sleep_for(std::chrono::milliseconds(REQUEST_DELAY));
     debug_out << "Request: " << url << std::endl;
@@ -69,6 +133,7 @@ int serial_curl_request(const std::string& url, void* writedata, long post = 0L,
     curl_easy_setopt(curl, CURLOPT_POST, post);
     curl_easy_setopt(curl, CURLOPT_POSTFIELDS, postfields);
     curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE, postfieldsize);
+    curl_easy_setopt(curl, CURLOPT_RANGE, range);
     if(!post){
         curl_easy_setopt(curl, CURLOPT_HTTPGET, 1L);
     }
@@ -123,7 +188,7 @@ static void split_path(const char* path, std::string& parent_path, std::string& 
 int studip_login(const std::string& username, const std::string& password){
     std::lock_guard<std::mutex> lock(login_mutex);
 
-    const std::filesystem::path cookieFile = "/tmp/studcookies.txt";
+    const std::filesystem::path cookieFile = COOKIE_FILE_PATH;
     try {
         if (std::filesystem::exists(cookieFile))
             std::filesystem::remove(cookieFile);
@@ -131,26 +196,23 @@ int studip_login(const std::string& username, const std::string& password){
         return log_err(std::string("Could not delete studcookies.txt: ") + e.what());
     }
 
-    const char* initial_url =
-        "https://studip.uni-hannover.de/Shibboleth.sso/Login?"
-        "target=https%3A%2F%2Fstudip.uni-hannover.de%2Fdispatch.php%2Flogin%3Fsso%3Dshib%26again%3Dyes%26cancel_login%3D1"
-        "&entityID=https%3A%2F%2Fsso.idm.uni-hannover.de%2Fidp%2Fshibboleth";
+    const char* initial_url = SHIBBOLETH_LOGIN_URL;
     std::string initial_response;
 
     if (serial_curl_request(initial_url, &initial_response)) {
         return log_err("First request for login failed.");
     }
     std::string action_path;
-    if (response_parse_first_match(R"(action\s*=\s*["']([^"']+)["'])", initial_response, action_path)){
+    if (response_parse_first_match(ACTION_REGEX, initial_response, action_path)){
         return log_err("Could not find action_path from first response.");
     }
     std::string csrf_token;
-    if (response_parse_first_match(R"(<input[^>]*name\s*=\s*["']csrf_token["'][^>]*value\s*=\s*["']([^"']+)["'])", initial_response, csrf_token)){
+    if (response_parse_first_match(CSRF_REGEX, initial_response, csrf_token)){
         return log_err("Could not find csrf_token from first response.");
     }
 
     std::string post_url;
-    post_url = "https://sso.idm.uni-hannover.de" + action_path;
+    post_url = std::string(SSO_BASE_URL) + action_path;
     std::string escaped_token = url_encode(csrf_token);
 
     std::ostringstream post_fields;
@@ -170,14 +232,14 @@ int studip_login(const std::string& username, const std::string& password){
         return log_err("Second request for login failed.");
     }
 
-    if (response_parse_first_match(R"(action\s*=\s*["']([^"']+)["'])", login_page_response, action_path)){
+    if (response_parse_first_match(ACTION_REGEX, login_page_response, action_path)){
         return log_err("Could not find action_path from second response.");
     }
-    if (response_parse_first_match(R"(<input[^>]*name\s*=\s*["']csrf_token["'][^>]*value\s*=\s*["']([^"']+)["'])", login_page_response, csrf_token)){
+    if (response_parse_first_match(CSRF_REGEX, login_page_response, csrf_token)){
         return log_err("Could not find csrf_token from second response.");
     }
 
-    post_url = "https://sso.idm.uni-hannover.de" + action_path;
+    post_url = std::string(SSO_BASE_URL) + action_path;
 
     escaped_token = url_encode(csrf_token);
     
@@ -193,15 +255,15 @@ int studip_login(const std::string& username, const std::string& password){
 
     std::string relay_state;
     std::string saml_response;
-    if (response_parse_first_match(R"(name="RelayState"\s+value="([^"]+)\")", logged_in_response, relay_state)){
+    if (response_parse_first_match(RELAY_STATE_REGEX, logged_in_response, relay_state)){
         return log_err("Could not find relay_state from third response.");
     }
-    if (response_parse_first_match(R"(name="SAMLResponse"\s+value="([^"]+)\")", logged_in_response, saml_response)){
+    if (response_parse_first_match(SAML_RESPONSE_REGEX, logged_in_response, saml_response)){
         return log_err("Could not find saml_response from third response.");
     }
     replace_all(relay_state, "&#x3a;", "%3A");
     replace_all(saml_response, "+", "%2B");
-    post_url = "https://studip.uni-hannover.de/Shibboleth.sso/SAML2/POST";
+    post_url = STUDIP_SAML_POST_URL;
     post_fields.str("");
     post_fields
         << "RelayState=" << relay_state
@@ -218,7 +280,7 @@ int make_api_request(const std::string& route, std::string& result, int max_trie
     if (max_tries < 1){
         return log_err("Reached maximum tries for API request and failed.");
     }
-    std::string api_url = "https://studip.uni-hannover.de/jsonapi.php/v1/" + route;
+    std::string api_url = std::string(STUDIP_JSONAPI_URL) + route;
 
     long http_code = 0;
     if (serial_curl_request(api_url, &result, 0L, nullptr, 0L, &http_code)){
@@ -289,7 +351,7 @@ static int for_each_paged_item(
 }
 
 std::string remove_jsonapi_prefix(std::string str){
-    const std::string prefix = "/jsonapi.php/v1/";
+    const std::string prefix = STUDIP_JSONAPI_PREFIX;
     if (str.rfind(prefix, 0) == 0)
         return str.substr(prefix.size());
     return str; 
@@ -648,11 +710,123 @@ static const file_entry* find_file_in_folder(
     return &it->second;
 }
 
+static int download_range(
+    const std::string& url,
+    std::uint64_t offset,
+    std::size_t length,
+    std::string& out)
+{
+    if (length == 0) {
+        out.clear();
+        return 0;
+    }
+    std::string range = std::to_string(offset) + "-" +
+        std::to_string(offset + length - 1);
+    long http_code = 0;
+    if (serial_curl_request(url, &out, 0L, nullptr, 0L, &http_code, range.c_str()))
+        return 1;
+    if (http_code != 206 && http_code != 200)
+        return log_err("Download request failed with status " + std::to_string(http_code));
+    return 0;
+}
+
+static int evict_cache_locked(std::size_t needed_bytes) {
+    while (cached_bytes + needed_bytes > MAX_CACHE_BYTES) {
+        if (lru_list.empty())
+            return 1;
+
+        lru_key key = lru_list.back();
+        lru_list.pop_back();
+
+        auto cache_it = file_caches.find(key.first);
+        if (cache_it == file_caches.end())
+            continue;
+
+        auto& chunks = cache_it->second.chunks;
+        auto chunk_it = chunks.find(key.second);
+        if (chunk_it == chunks.end())
+            continue;
+
+        cached_bytes -= chunk_it->second.data.size();
+        chunks.erase(chunk_it);
+        if (chunks.empty())
+            file_caches.erase(cache_it);
+    }
+    return 0;
+}
+
+static int get_cached_chunk(
+    const std::string& path,
+    const file_entry& file,
+    std::size_t chunk_index,
+    std::string& out)
+{
+    std::size_t chunk_size = 0;
+    {
+        std::unique_lock<std::mutex> lock(cache_mutex);
+        auto& cache = file_caches[path];
+        while (true) {
+            chunk_size = compute_cache_chunk_size_locked(cache, file);
+            auto chunk_it = cache.chunks.find(chunk_index);
+            if (chunk_it != cache.chunks.end()) {
+                lru_list.splice(lru_list.begin(), lru_list, chunk_it->second.lru_it);
+                chunk_it->second.lru_it = lru_list.begin();
+                out = chunk_it->second.data;
+                return 0;
+            }
+            if (cache.downloading.count(chunk_index) == 0) {
+                cache.downloading.insert(chunk_index);
+                break;
+            }
+            cache_cv.wait(lock);
+        }
+    }
+
+    std::uint64_t start = static_cast<std::uint64_t>(chunk_index) * chunk_size;
+    std::size_t length = std::min<std::size_t>(chunk_size, file.size - start);
+
+    std::string data;
+    std::string download_url = std::string(STUDIP_BASE_URL) + "/" + file.download_url;
+    if (download_range(download_url, start, length, data)) {
+        std::lock_guard<std::mutex> lock(cache_mutex);
+        auto cache_it = file_caches.find(path);
+        if (cache_it != file_caches.end()) {
+            cache_it->second.downloading.erase(chunk_index);
+        }
+        cache_cv.notify_all();
+        return 1;
+    }
+
+    {
+        std::unique_lock<std::mutex> lock(cache_mutex);
+        auto& cache = file_caches[path];
+        std::size_t current_chunk_size = compute_cache_chunk_size_locked(cache, file);
+
+        if(evict_cache_locked(data.size())){
+            debug_out << "File cache is full!" << std::endl;
+            cache.downloading.erase(chunk_index);
+            cache_cv.notify_all();
+            out = data;
+            return 0;
+        };
+
+        cached_bytes += data.size();
+        lru_list.emplace_front(path, chunk_index);
+        cache.chunks.emplace(
+            chunk_index,
+            cached_chunk{data, lru_list.begin()});
+        cache.downloading.erase(chunk_index);
+        cache_cv.notify_all();
+        out = data;
+    }
+    return 0;
+}
+
 static int fs_getattr(const char* path, struct stat* stbuf, struct fuse_file_info*){
     memset(stbuf, 0, sizeof(struct stat));
 
     if (strcmp(path, "/") == 0) {
-        stbuf->st_mode  = S_IFDIR | 0555;
+        stbuf->st_mode  = S_IFDIR | 0777;
         stbuf->st_nlink = 2;
         return 0;
     }
@@ -668,14 +842,14 @@ static int fs_getattr(const char* path, struct stat* stbuf, struct fuse_file_inf
 
     auto sub_it = parent->subfolders.find(name);
     if (sub_it != parent->subfolders.end()) {
-        stbuf->st_mode  = S_IFDIR | 0555;
+        stbuf->st_mode  = S_IFDIR | 0777;
         stbuf->st_nlink = 2;
         return 0;
     }
 
     const file_entry* file = find_file_in_folder(*parent, name);
     if (file) {
-        stbuf->st_mode  = S_IFREG | 0444;
+        stbuf->st_mode  = S_IFREG | 0644;
         stbuf->st_nlink = 1;
         stbuf->st_size  = file->size;
 
@@ -689,6 +863,88 @@ static int fs_getattr(const char* path, struct stat* stbuf, struct fuse_file_inf
     return -ENOENT;
 }
 
+static int fs_open(const char* path, struct fuse_file_info* fi){
+    if ((fi->flags & O_ACCMODE) != O_RDONLY)
+        return -EACCES;
+
+    std::string parent_path;
+    std::string name;
+    split_path(path, parent_path, name);
+    if (reload_fs_structure(parent_path))
+        return -EIO;
+
+    std::shared_lock<std::shared_mutex> lock(fs_mutex);
+    folder* parent = find_folder_by_path(fs_root, parent_path);
+    if (!parent)
+        return -ENOENT;
+
+    const file_entry* file = find_file_in_folder(*parent, name);
+    if (!file)
+        return -ENOENT;
+
+    return 0;
+}
+
+static int fs_read(
+    const char* path,
+    char* buf,
+    size_t size,
+    off_t offset,
+    struct fuse_file_info*)
+{
+    if (size == 0)
+        return 0;
+
+    std::string parent_path;
+    std::string name;
+    split_path(path, parent_path, name);
+    if (reload_fs_structure(parent_path))
+        return -EIO;
+
+    file_entry file;
+    {
+        std::shared_lock<std::shared_mutex> lock(fs_mutex);
+        folder* parent = find_folder_by_path(fs_root, parent_path);
+        if (!parent)
+            return -ENOENT;
+
+        const file_entry* found = find_file_in_folder(*parent, name);
+        if (!found)
+            return -ENOENT;
+        file = *found;
+    }
+
+    if (offset >= static_cast<off_t>(file.size))
+        return 0;
+
+    std::size_t remaining = static_cast<std::size_t>(
+        std::min<std::uint64_t>(file.size - static_cast<std::uint64_t>(offset), size));
+
+    std::size_t chunk_size = get_cache_chunk_size(path, file);
+    std::size_t total = 0;
+    while (total < remaining) {
+        std::uint64_t current_offset = static_cast<std::uint64_t>(offset) + total;
+        std::size_t chunk_index = static_cast<std::size_t>(current_offset / chunk_size);
+        std::size_t chunk_offset = static_cast<std::size_t>(current_offset % chunk_size);
+        std::size_t to_copy = std::min(remaining - total, chunk_size - chunk_offset);
+
+        std::string chunk_data;
+        if (get_cached_chunk(path, file, chunk_index, chunk_data))
+            return -EIO;
+
+        if (chunk_offset >= chunk_data.size())
+            break;
+
+        std::size_t available = chunk_data.size() - chunk_offset;
+        std::size_t copy_size = std::min(to_copy, available);
+        memcpy(buf + total, chunk_data.data() + chunk_offset, copy_size);
+        total += copy_size;
+        if (copy_size < to_copy)
+            break;
+    }
+
+    return static_cast<int>(total);
+}
 
 static int fs_readdir(
     const char* path,
@@ -724,18 +980,22 @@ static int fs_readdir(
 
 static const struct fuse_operations fs_ops = {
     .getattr = fs_getattr,
+    .open = fs_open,
+    .read = fs_read,
     .readdir = fs_readdir,
 };
 
 int main() {
     debug_out.open("/tmp/studdebug_out.txt", std::ios_base::app);
+    debug_out << std::endl << "-------------------------------------New Session-------------------------------------" << std::endl; 
     curl_global_init(CURL_GLOBAL_DEFAULT);
     curl = curl_easy_init();
     curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
-    curl_easy_setopt(curl, CURLOPT_COOKIEJAR, "/tmp/studcookies.txt");
-    curl_easy_setopt(curl, CURLOPT_COOKIEFILE, "/tmp/studcookies.txt");
+    curl_easy_setopt(curl, CURLOPT_COOKIEJAR, COOKIE_FILE_PATH);
+    curl_easy_setopt(curl, CURLOPT_COOKIEFILE, COOKIE_FILE_PATH);
     curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, WriteToString);
     curl_easy_setopt(curl, CURLOPT_ACCEPT_ENCODING, "");
+    curl_easy_setopt(curl, CURLOPT_TIMEOUT, REQUEST_TIMEOUT);
     if(studip_login(USERNAME, PASSWORD)){
         std::cerr << "Initial login failed! studip_fs terminated." << std::endl;
         curl_easy_cleanup(curl);
@@ -743,8 +1003,8 @@ int main() {
         return 1;
     }
 
-    int fuse_argc = 2;
-    char *fuse_argv[] = { (char*)"studip_fs", (char*)"test", nullptr };
+    int fuse_argc = 4;
+    char *fuse_argv[] = { (char*)"studip_fs", (char*)"test", (char*)"-o", (char*)"ro", nullptr };
 
     int ret = fuse_main(fuse_argc, fuse_argv, &fs_ops, nullptr);
     debug_out.close();
