@@ -1,0 +1,19 @@
+{
+  "username": "[YOUR WEBSSO USERNAME]",
+  "password": "[YOUR WEBSSO PASSWORD]",
+  "page_limit": 100,
+  "tree_cache": 300,
+  "request_delay": 100,
+  "request_timeout": 30,
+  "chunk_size_fraction": 0.2,
+  "min_chunk_size": 262144,
+  "max_chunk_size": 4194304,
+  "max_cache_bytes": 838860800,
+  "cookie_file_path": "/tmp/studcookies.txt",
+  "studip_base_url": "https://studip.uni-hannover.de",
+  "studip_jsonapi_prefix": "/jsonapi.php/v1/",
+  "studip_jsonapi_url": "https://studip.uni-hannover.de/jsonapi.php/v1/",
+  "sso_base_url": "https://sso.idm.uni-hannover.de",
+  "studip_saml_post_url": "https://studip.uni-hannover.de/Shibboleth.sso/SAML2/POST",
+  "shibboleth_login_url": "https://studip.uni-hannover.de/Shibboleth.sso/Login?target=https%3A%2F%2Fstudip.uni-hannover.de%2Fdispatch.php%2Flogin%3Fsso%3Dshib%26again%3Dyes%26cancel_login%3D1&entityID=https%3A%2F%2Fsso.idm.uni-hannover.de%2Fidp%2Fshibboleth"
+}

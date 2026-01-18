@@ -13,30 +13,36 @@
 #include <shared_mutex>
 #include <thread>
 #include <list>
-#include "secrets/login.h"
 
-const std::size_t PAGE_LIMIT = 100;
-const time_t TREE_CACHE = 300;
-const int REQUEST_DELAY = 100;
-const long REQUEST_TIMEOUT = 30;
-const double CHUNK_SIZE_FRACTION = 0.2;
-const std::size_t MIN_CHUNK_SIZE = 256 * 1024;
-const std::size_t MAX_CHUNK_SIZE = 4 * 1024 * 1024;
-const std::size_t MAX_CACHE_BYTES = 800 * 1024 * 1024;
-const char* COOKIE_FILE_PATH = "/tmp/studcookies.txt";
-const char* STUDIP_BASE_URL = "https://studip.uni-hannover.de";
-const char* STUDIP_JSONAPI_PREFIX = "/jsonapi.php/v1/";
-const char* STUDIP_JSONAPI_URL = "https://studip.uni-hannover.de/jsonapi.php/v1/";
-const char* SSO_BASE_URL = "https://sso.idm.uni-hannover.de";
-const char* STUDIP_SAML_POST_URL = "https://studip.uni-hannover.de/Shibboleth.sso/SAML2/POST";
-const char* SHIBBOLETH_LOGIN_URL =
-    "https://studip.uni-hannover.de/Shibboleth.sso/Login?"
-    "target=https%3A%2F%2Fstudip.uni-hannover.de%2Fdispatch.php%2Flogin%3Fsso%3Dshib%26again%3Dyes%26cancel_login%3D1"
-    "&entityID=https%3A%2F%2Fsso.idm.uni-hannover.de%2Fidp%2Fshibboleth";
-const char* ACTION_REGEX = R"(action\s*=\s*["']([^"']+)["'])";
-const char* CSRF_REGEX = R"(<input[^>]*name\s*=\s*["']csrf_token["'][^>]*value\s*=\s*["']([^"']+)["'])";
-const char* RELAY_STATE_REGEX = R"(name="RelayState"\s+value="([^"]+)\")";
-const char* SAML_RESPONSE_REGEX = R"(name="SAMLResponse"\s+value="([^"]+)\")";
+struct Settings {
+    std::size_t page_limit = 100;
+    time_t tree_cache = 300;
+    int request_delay = 100;
+    long request_timeout = 30;
+    double chunk_size_fraction = 0.2;
+    std::size_t min_chunk_size = 256 * 1024;
+    std::size_t max_chunk_size = 4 * 1024 * 1024;
+    std::size_t max_cache_bytes = 800 * 1024 * 1024;
+    std::string cookie_file_path = "/tmp/studcookies.txt";
+    std::string studip_base_url = "https://studip.uni-hannover.de";
+    std::string studip_jsonapi_prefix = "/jsonapi.php/v1/";
+    std::string studip_jsonapi_url = "https://studip.uni-hannover.de/jsonapi.php/v1/";
+    std::string sso_base_url = "https://sso.idm.uni-hannover.de";
+    std::string studip_saml_post_url = "https://studip.uni-hannover.de/Shibboleth.sso/SAML2/POST";
+    std::string shibboleth_login_url =
+        "https://studip.uni-hannover.de/Shibboleth.sso/Login?"
+        "target=https%3A%2F%2Fstudip.uni-hannover.de%2Fdispatch.php%2Flogin%3Fsso%3Dshib%26again%3Dyes%26cancel_login%3D1"
+        "&entityID=https%3A%2F%2Fsso.idm.uni-hannover.de%2Fidp%2Fshibboleth";
+    std::string username = "[YOUR USERNAME]";
+    std::string password = "[YOUR PASSWORD]";
+};
+
+static Settings settings;
+
+const std::string ACTION_REGEX = R"(action\s*=\s*["']([^"']+)["'])";
+const std::string CSRF_REGEX = R"(<input[^>]*name\s*=\s*["']csrf_token["'][^>]*value\s*=\s*["']([^"']+)["'])";
+const std::string RELAY_STATE_REGEX = R"(name="RelayState"\s+value="([^"]+)\")";
+const std::string SAML_RESPONSE_REGEX = R"(name="SAMLResponse"\s+value="([^"]+)\")";
 
 struct file_entry {
     std::string name;
@@ -89,10 +95,169 @@ std::size_t cached_bytes = 0;
 std::map<std::string, file_cache> file_caches;
 std::list<lru_key> lru_list;
 
+template <typename T>
+static void apply_json_value(const nlohmann::json& j, const char* key, T& target) {
+    if (!j.contains(key))
+        return;
+    try {
+        target = j.at(key).get<T>();
+    } catch (const std::exception& e) {
+        std::cerr << std::string("Invalid config value for ") << key << ": " << e.what() << std::endl;
+    }
+}
+
+static void apply_json_time_t(const nlohmann::json& j, const char* key, time_t& target) {
+    if (!j.contains(key))
+        return;
+    try {
+        long long value = j.at(key).get<long long>();
+        target = static_cast<time_t>(value);
+    } catch (const std::exception& e) {
+        std::cerr << std::string("Invalid config value for ") << key << ": " << e.what() << std::endl;
+    }
+}
+
+static std::optional<std::filesystem::path> find_config_path() {
+    const char* env = std::getenv("STUDIP_FS_CONFIG");
+    if (env && *env)
+        return std::filesystem::path(env);
+
+    std::filesystem::path local = "studip_fs.json";
+    try {
+        if (std::filesystem::exists(local))
+            return local;
+    } catch (const std::filesystem::filesystem_error&) {
+    }
+
+    std::filesystem::path config_path;
+    const char* xdg = std::getenv("XDG_CONFIG_HOME");
+    if (xdg && *xdg) {
+        config_path = std::filesystem::path(xdg) / "studip_fs" / "config.json";
+    } else {
+        const char* home = std::getenv("HOME");
+        if (home && *home)
+            config_path = std::filesystem::path(home) / ".config" / "studip_fs" / "config.json";
+    }
+    if (!config_path.empty()) {
+        try {
+            if (std::filesystem::exists(config_path))
+                return config_path;
+        } catch (const std::filesystem::filesystem_error&) {
+        }
+    }
+
+    return std::nullopt;
+}
+
+static std::filesystem::path get_default_config_path() {
+    const char* env = std::getenv("STUDIP_FS_CONFIG");
+    if (env && *env)
+        return std::filesystem::path(env);
+
+    const char* xdg = std::getenv("XDG_CONFIG_HOME");
+    if (xdg && *xdg)
+        return std::filesystem::path(xdg) / "studip_fs" / "config.json";
+
+    const char* home = std::getenv("HOME");
+    if (home && *home)
+        return std::filesystem::path(home) / ".config" / "studip_fs" / "config.json";
+
+    return "studip_fs.json";
+}
+
+static nlohmann::ordered_json build_default_config_json() {
+    return {
+        {"username", settings.username},
+        {"password", settings.password},
+        {"page_limit", settings.page_limit},
+        {"tree_cache", static_cast<long long>(settings.tree_cache)},
+        {"request_delay", settings.request_delay},
+        {"request_timeout", settings.request_timeout},
+        {"chunk_size_fraction", settings.chunk_size_fraction},
+        {"min_chunk_size", settings.min_chunk_size},
+        {"max_chunk_size", settings.max_chunk_size},
+        {"max_cache_bytes", settings.max_cache_bytes},
+        {"cookie_file_path", settings.cookie_file_path},
+        {"studip_base_url", settings.studip_base_url},
+        {"studip_jsonapi_prefix", settings.studip_jsonapi_prefix},
+        {"studip_jsonapi_url", settings.studip_jsonapi_url},
+        {"sso_base_url", settings.sso_base_url},
+        {"studip_saml_post_url", settings.studip_saml_post_url},
+        {"shibboleth_login_url", settings.shibboleth_login_url}
+    };
+}
+
+static bool write_default_config(const std::filesystem::path& path) {
+    try {
+        if (path.has_parent_path())
+            std::filesystem::create_directories(path.parent_path());
+    } catch (const std::filesystem::filesystem_error& e) {
+        std::cerr << "Failed to create config directory: " << e.what() << std::endl;
+        return false;
+    }
+
+    std::ofstream out(path);
+    if (!out) {
+        std::cerr << "Could not write default config file: " << path.string() << std::endl;
+        return false;
+    }
+
+    out << build_default_config_json().dump(4) << std::endl;
+    return static_cast<bool>(out);
+}
+
+static int load_settings() {
+    std::optional<std::filesystem::path> config_path = find_config_path();
+    if (!config_path) {
+        std::filesystem::path create_path = get_default_config_path();
+        if (write_default_config(create_path)) {
+            std::cerr << "Could not find config file. Created default one at "
+                      << create_path.string() << std::endl;
+            std::cerr << "You can set STUDIP_FS_CONFIG to change the path of the config file." << std::endl;
+            config_path = create_path;
+        } else {
+            std::cerr << "Error: Could not find config file and failed to create a default one." << std::endl;
+            return 1;
+        }
+    }
+
+    std::ifstream in(*config_path);
+    if (!in) {
+        std::cerr << "Could not open config file: " << config_path->string() << std::endl;
+        return 1;
+    }
+
+    try {
+        nlohmann::json j;
+        in >> j;
+        apply_json_value(j, "page_limit", settings.page_limit);
+        apply_json_time_t(j, "tree_cache", settings.tree_cache);
+        apply_json_value(j, "request_delay", settings.request_delay);
+        apply_json_value(j, "request_timeout", settings.request_timeout);
+        apply_json_value(j, "chunk_size_fraction", settings.chunk_size_fraction);
+        apply_json_value(j, "min_chunk_size", settings.min_chunk_size);
+        apply_json_value(j, "max_chunk_size", settings.max_chunk_size);
+        apply_json_value(j, "max_cache_bytes", settings.max_cache_bytes);
+        apply_json_value(j, "cookie_file_path", settings.cookie_file_path);
+        apply_json_value(j, "studip_base_url", settings.studip_base_url);
+        apply_json_value(j, "studip_jsonapi_prefix", settings.studip_jsonapi_prefix);
+        apply_json_value(j, "studip_jsonapi_url", settings.studip_jsonapi_url);
+        apply_json_value(j, "sso_base_url", settings.sso_base_url);
+        apply_json_value(j, "studip_saml_post_url", settings.studip_saml_post_url);
+        apply_json_value(j, "shibboleth_login_url", settings.shibboleth_login_url);
+        apply_json_value(j, "username", settings.username);
+        apply_json_value(j, "password", settings.password);
+    } catch (const std::exception& e) {
+        std::cerr << "Failed to parse config file " << config_path->string() << ": " << e.what() << std::endl;
+        return 1;
+    }
+    return 0;
+}
+
 static std::size_t compute_cache_chunk_size_locked(file_cache& cache, const file_entry& file) {
-    double scaled = static_cast<double>(file.size) * CHUNK_SIZE_FRACTION;
-    double min_size = static_cast<double>(MIN_CHUNK_SIZE);
-    double max_size = static_cast<double>(MAX_CHUNK_SIZE);
+    double scaled = static_cast<double>(file.size) * settings.chunk_size_fraction;
+    double min_size = static_cast<double>(settings.min_chunk_size);
+    double max_size = static_cast<double>(settings.max_chunk_size);
     scaled += 10.0;
     if (scaled < min_size)
         scaled = min_size;
@@ -126,8 +291,8 @@ int serial_curl_request(
     const char* range = nullptr){
 
     std::lock_guard<std::mutex> lock(curl_mutex);
-    std::this_thread::sleep_for(std::chrono::milliseconds(REQUEST_DELAY));
-    debug_out << "Request: " << url << std::endl;
+    std::this_thread::sleep_for(std::chrono::milliseconds(settings.request_delay));
+    //debug_out << "Request: " << url << std::endl;
     curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
     curl_easy_setopt(curl, CURLOPT_WRITEDATA, writedata);
     curl_easy_setopt(curl, CURLOPT_POST, post);
@@ -185,10 +350,10 @@ static void split_path(const char* path, std::string& parent_path, std::string& 
     name = full.substr(pos + 1);
 }
 
-int studip_login(const std::string& username, const std::string& password){
+int studip_login(){
     std::lock_guard<std::mutex> lock(login_mutex);
 
-    const std::filesystem::path cookieFile = COOKIE_FILE_PATH;
+    const std::filesystem::path cookieFile = settings.cookie_file_path;
     try {
         if (std::filesystem::exists(cookieFile))
             std::filesystem::remove(cookieFile);
@@ -196,7 +361,7 @@ int studip_login(const std::string& username, const std::string& password){
         return log_err(std::string("Could not delete studcookies.txt: ") + e.what());
     }
 
-    const char* initial_url = SHIBBOLETH_LOGIN_URL;
+    const std::string& initial_url = settings.shibboleth_login_url;
     std::string initial_response;
 
     if (serial_curl_request(initial_url, &initial_response)) {
@@ -212,7 +377,7 @@ int studip_login(const std::string& username, const std::string& password){
     }
 
     std::string post_url;
-    post_url = std::string(SSO_BASE_URL) + action_path;
+    post_url = settings.sso_base_url + action_path;
     std::string escaped_token = url_encode(csrf_token);
 
     std::ostringstream post_fields;
@@ -239,14 +404,14 @@ int studip_login(const std::string& username, const std::string& password){
         return log_err("Could not find csrf_token from second response.");
     }
 
-    post_url = std::string(SSO_BASE_URL) + action_path;
+    post_url = settings.sso_base_url + action_path;
 
     escaped_token = url_encode(csrf_token);
     
     post_fields.str("");
     post_fields
         << "csrf_token=" << escaped_token
-        << "&j_username=" << USERNAME << "&j_password=" << PASSWORD << "&_eventId_proceed=";
+        << "&j_username=" << settings.username << "&j_password=" << settings.password << "&_eventId_proceed=";
 
     std::string logged_in_response;
     if (serial_curl_request(post_url, &logged_in_response, 1L, post_fields.str().c_str(), (long)post_fields.str().size())) {
@@ -263,7 +428,7 @@ int studip_login(const std::string& username, const std::string& password){
     }
     replace_all(relay_state, "&#x3a;", "%3A");
     replace_all(saml_response, "+", "%2B");
-    post_url = STUDIP_SAML_POST_URL;
+    post_url = settings.studip_saml_post_url;
     post_fields.str("");
     post_fields
         << "RelayState=" << relay_state
@@ -280,15 +445,15 @@ int make_api_request(const std::string& route, std::string& result, int max_trie
     if (max_tries < 1){
         return log_err("Reached maximum tries for API request and failed.");
     }
-    std::string api_url = std::string(STUDIP_JSONAPI_URL) + route;
+    std::string api_url = settings.studip_jsonapi_url + route;
 
     long http_code = 0;
     if (serial_curl_request(api_url, &result, 0L, nullptr, 0L, &http_code)){
         return log_err("API request failed: " + api_url);
     }
     if (http_code == 401){
-        debug_out << "API request failed because of missing authorization, trying to login..." << std::endl;
-        if (studip_login(USERNAME, PASSWORD)){
+        log_err("API request failed because of missing authorization, trying to login...");
+        if (studip_login()){
             return log_err("Login after unauthorized API request failed.");
         }
         return make_api_request(route, result, max_tries - 1);
@@ -307,7 +472,7 @@ static int for_each_paged_item(
     const std::function<int(const nlohmann::json&)>& handle_item)
 {
     std::size_t offset = 0;
-    std::size_t limit = PAGE_LIMIT;
+    std::size_t limit = settings.page_limit;
 
     while (true) {
         std::string json;
@@ -351,7 +516,7 @@ static int for_each_paged_item(
 }
 
 std::string remove_jsonapi_prefix(std::string str){
-    const std::string prefix = STUDIP_JSONAPI_PREFIX;
+    const std::string& prefix = settings.studip_jsonapi_prefix;
     if (str.rfind(prefix, 0) == 0)
         return str.substr(prefix.size());
     return str; 
@@ -385,7 +550,6 @@ int find_courses_route(std::string& route){
     }
     std::string courses_field;
     if (parse_json(users_me, "/data/relationships/courses/links/related", &courses_field)){
-        debug_out << users_me;
         return log_err("Failed to find courses because of JSON error.");
     }
     route = remove_jsonapi_prefix(courses_field);
@@ -504,7 +668,7 @@ int list_courses(const std::string& route, std::vector<course>& courses, std::se
     int rc = for_each_paged_item(route, [&](const nlohmann::json& item) {
         course c;
         if (parse_course_item(item, c)) {
-            debug_out << "Course had invalid data." << std::endl;
+            log_err("Course had invalid data.");
             return 0;
         }
         semesters.insert(c.start_semester_url);
@@ -572,7 +736,7 @@ int reload_fs_structure(const std::string& path){
     if (!node) {
         return 0;
     }
-    if(std::time(nullptr) - TREE_CACHE < node->children_loaded){
+    if(std::time(nullptr) - settings.tree_cache < node->children_loaded){
         return 0;
     }
 
@@ -731,7 +895,7 @@ static int download_range(
 }
 
 static int evict_cache_locked(std::size_t needed_bytes) {
-    while (cached_bytes + needed_bytes > MAX_CACHE_BYTES) {
+    while (cached_bytes + needed_bytes > settings.max_cache_bytes) {
         if (lru_list.empty())
             return 1;
 
@@ -786,7 +950,7 @@ static int get_cached_chunk(
     std::size_t length = std::min<std::size_t>(chunk_size, file.size - start);
 
     std::string data;
-    std::string download_url = std::string(STUDIP_BASE_URL) + "/" + file.download_url;
+    std::string download_url = settings.studip_base_url + "/" + file.download_url;
     if (download_range(download_url, start, length, data)) {
         std::lock_guard<std::mutex> lock(cache_mutex);
         auto cache_it = file_caches.find(path);
@@ -803,7 +967,7 @@ static int get_cached_chunk(
         std::size_t current_chunk_size = compute_cache_chunk_size_locked(cache, file);
 
         if(evict_cache_locked(data.size())){
-            debug_out << "File cache is full!" << std::endl;
+            log_err("File cache is full!");
             cache.downloading.erase(chunk_index);
             cache_cv.notify_all();
             out = data;
@@ -988,15 +1152,21 @@ static const struct fuse_operations fs_ops = {
 int main() {
     debug_out.open("/tmp/studdebug_out.txt", std::ios_base::app);
     debug_out << std::endl << "-------------------------------------New Session-------------------------------------" << std::endl; 
+    if(load_settings()){
+        return 1;
+    }
+    if(settings.username == "[YOUR USERNAME]"){
+        return 1;
+    }
     curl_global_init(CURL_GLOBAL_DEFAULT);
     curl = curl_easy_init();
     curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
-    curl_easy_setopt(curl, CURLOPT_COOKIEJAR, COOKIE_FILE_PATH);
-    curl_easy_setopt(curl, CURLOPT_COOKIEFILE, COOKIE_FILE_PATH);
+    curl_easy_setopt(curl, CURLOPT_COOKIEJAR, settings.cookie_file_path.c_str());
+    curl_easy_setopt(curl, CURLOPT_COOKIEFILE, settings.cookie_file_path.c_str());
     curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, WriteToString);
     curl_easy_setopt(curl, CURLOPT_ACCEPT_ENCODING, "");
-    curl_easy_setopt(curl, CURLOPT_TIMEOUT, REQUEST_TIMEOUT);
-    if(studip_login(USERNAME, PASSWORD)){
+    curl_easy_setopt(curl, CURLOPT_TIMEOUT, settings.request_timeout);
+    if(studip_login()){
         std::cerr << "Initial login failed! studip_fs terminated." << std::endl;
         curl_easy_cleanup(curl);
         curl_global_cleanup();
