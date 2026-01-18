@@ -2,7 +2,7 @@ cmake_minimum_required(VERSION 3.10)
 
 project(studip_fs
     LANGUAGES CXX
-    VERSION 0.0.1
+    VERSION 0.1.0
 )
 
 find_package(CURL REQUIRED)

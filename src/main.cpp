@@ -35,6 +35,7 @@ struct Settings {
         "&entityID=https%3A%2F%2Fsso.idm.uni-hannover.de%2Fidp%2Fshibboleth";
     std::string username = "[YOUR USERNAME]";
     std::string password = "[YOUR PASSWORD]";
+    std::string mount_point = "studip_fs";
 };
 
 static Settings settings;
@@ -183,7 +184,8 @@ static nlohmann::ordered_json build_default_config_json() {
         {"studip_jsonapi_url", settings.studip_jsonapi_url},
         {"sso_base_url", settings.sso_base_url},
         {"studip_saml_post_url", settings.studip_saml_post_url},
-        {"shibboleth_login_url", settings.shibboleth_login_url}
+        {"shibboleth_login_url", settings.shibboleth_login_url},
+        {"mount_point", settings.mount_point}
     };
 }
 
@@ -247,6 +249,7 @@ static int load_settings() {
         apply_json_value(j, "shibboleth_login_url", settings.shibboleth_login_url);
         apply_json_value(j, "username", settings.username);
         apply_json_value(j, "password", settings.password);
+        apply_json_value(j, "mount_point", settings.mount_point);
     } catch (const std::exception& e) {
         std::cerr << "Failed to parse config file " << config_path->string() << ": " << e.what() << std::endl;
         return 1;
@@ -292,7 +295,7 @@ int serial_curl_request(
 
     std::lock_guard<std::mutex> lock(curl_mutex);
     std::this_thread::sleep_for(std::chrono::milliseconds(settings.request_delay));
-    //debug_out << "Request: " << url << std::endl;
+    debug_out << "Request: " << url << std::endl;
     curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
     curl_easy_setopt(curl, CURLOPT_WRITEDATA, writedata);
     curl_easy_setopt(curl, CURLOPT_POST, post);
@@ -353,12 +356,11 @@ static void split_path(const char* path, std::string& parent_path, std::string& 
 int studip_login(){
     std::lock_guard<std::mutex> lock(login_mutex);
 
-    const std::filesystem::path cookieFile = settings.cookie_file_path;
     try {
-        if (std::filesystem::exists(cookieFile))
-            std::filesystem::remove(cookieFile);
+        if (std::filesystem::exists(settings.cookie_file_path))
+            std::filesystem::remove(settings.cookie_file_path);
     } catch (const std::filesystem::filesystem_error& e) {
-        return log_err(std::string("Could not delete studcookies.txt: ") + e.what());
+        return log_err(std::string("Could not delete" + settings.cookie_file_path + ": ") + e.what());
     }
 
     const std::string& initial_url = settings.shibboleth_login_url;
@@ -1173,10 +1175,30 @@ int main() {
         return 1;
     }
 
-    int fuse_argc = 4;
-    char *fuse_argv[] = { (char*)"studip_fs", (char*)"test", (char*)"-o", (char*)"ro", nullptr };
+    if (settings.mount_point.empty()) {
+        std::cerr << "Mount point is empty. Set mount_point in the config file." << std::endl;
+        curl_easy_cleanup(curl);
+        curl_global_cleanup();
+        return 1;
+    }
 
+    int fuse_argc = 4;
+    char *fuse_argv[] = {
+        (char*)"studip_fs",
+        (char*)settings.mount_point.c_str(),
+        (char*)"-o",
+        (char*)"ro",
+        nullptr
+    };
     int ret = fuse_main(fuse_argc, fuse_argv, &fs_ops, nullptr);
+
+    try {
+        if (std::filesystem::exists(settings.cookie_file_path))
+            std::filesystem::remove(settings.cookie_file_path);
+    } catch (const std::filesystem::filesystem_error& e) {
+        return log_err(std::string("Could not delete" + settings.cookie_file_path + ": ") + e.what());
+    }
+
     debug_out.close();
     curl_easy_cleanup(curl);
     curl_global_cleanup();
