@@ -53,8 +53,17 @@ struct file_entry {
     std::string download_url;
 };
 
+enum folder_type{
+    ROOT,
+    SEMESTER,
+    COURSE,
+    PERSONAL,
+    DEFAULT,
+};
+
 struct folder {
     std::string name;
+    folder_type type;
 
     std::string folders_url;
     std::string files_url;
@@ -545,7 +554,7 @@ int parse_json(const std::string& json, const std::string& field, std::string* r
     return 1;
 }
 
-int find_courses_route(std::string& route){
+int find_courses_route(std::string& courses_route, std::string& personal_files_route){
     std::string users_me;
     if (make_api_request("users/me", users_me, 2)){
         return log_err("User info request failed.");
@@ -554,7 +563,12 @@ int find_courses_route(std::string& route){
     if (parse_json(users_me, "/data/relationships/courses/links/related", &courses_field)){
         return log_err("Failed to find courses because of JSON error.");
     }
-    route = remove_jsonapi_prefix(courses_field);
+    std::string personal_files_field;
+    if (parse_json(users_me, "/data/relationships/folders/links/related", &personal_files_field)){
+        return log_err("Failed to find personal files because of JSON error.");
+    }
+    courses_route = remove_jsonapi_prefix(courses_field);
+    personal_files_route = remove_jsonapi_prefix(personal_files_field);
     return 0;
 }
 
@@ -599,6 +613,7 @@ static int parse_folder_item(const nlohmann::json& item, folder& out) {
         out.folders_url = remove_jsonapi_prefix(item.at("relationships").at("folders").at("links").at("related").get<std::string>());
         out.files_url = remove_jsonapi_prefix(item.at("relationships").at("file-refs").at("links").at("related").get<std::string>());
         out.children_loaded = 0;
+        out.type = folder_type::DEFAULT;
         return 0;
     } catch (...) {
         return 1;
@@ -742,16 +757,17 @@ int reload_fs_structure(const std::string& path){
         return 0;
     }
 
-    if (path == "/" || (node->folders_url.empty() && node->files_url.empty())) {
+    if (path == "/" || node->type == folder_type::ROOT || node->type == folder_type::SEMESTER) {
         fs_root.name.clear();
         fs_root.folders_url.clear();
         fs_root.files_url.clear();
         fs_root.subfolders.clear();
         fs_root.files.clear();
-        fs_root.children_loaded = std::time(nullptr);
-
+        fs_root.type = folder_type::ROOT;
+        
         std::string courses_route;
-        if (find_courses_route(courses_route)) {
+        std::string personal_files_route;
+        if (find_courses_route(courses_route, personal_files_route)) {
             return 1;
         }
 
@@ -760,6 +776,15 @@ int reload_fs_structure(const std::string& path){
         if (list_courses(courses_route, courses, semester_routes)) {
             return 1;
         }
+
+        folder personal_files;
+        personal_files.name = "Personal Files";
+        personal_files.folders_url = personal_files_route;
+        personal_files.files_url.clear();
+        personal_files.subfolders.clear();
+        personal_files.children_loaded = 0; 
+        personal_files.type = folder_type::PERSONAL;
+        fs_root.subfolders.emplace("Personal Files", personal_files);
 
         std::map<std::string, std::string> semester_titles;
         for (const auto& sem_route : semester_routes) {
@@ -784,31 +809,33 @@ int reload_fs_structure(const std::string& path){
             sem.name = title;
             sem.folders_url.clear();
             sem.files_url.clear();
+            sem.type = folder_type::SEMESTER;
             sem.children_loaded = 0;
 
             auto [it, inserted] = fs_root.subfolders.emplace(sem.name, std::move(sem));
             semester_nodes[route] = &it->second;
         }
-
+        
         for (const auto& c : courses) {
             auto it = semester_nodes.find(c.start_semester_url);
             if (it == semester_nodes.end())
                 continue;
 
-            folder course;
-            course.name = c.title;
-
+                folder course;
+                course.name = c.title;
+            course.type = folder_type::COURSE;
             course.folders_url = c.folders_url;
             course.files_url.clear();
             course.children_loaded = 0;
-
+            
             it->second->subfolders.emplace(course.name, std::move(course));
             it->second->children_loaded = std::time(nullptr);
         }
+        fs_root.children_loaded = std::time(nullptr);
         return 0;
     }
 
-    if (!node->folders_url.empty() && node->files_url.empty()) {
+    if (node->type == folder_type::COURSE || node->type == folder_type::PERSONAL) {
         node->subfolders.clear();
         node->files.clear();
         node->children_loaded = 0;
