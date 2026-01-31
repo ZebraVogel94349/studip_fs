@@ -880,17 +880,28 @@ static int download_range(
     const std::string& url,
     std::uint64_t offset,
     std::size_t length,
-    std::string& out)
+    std::string& out,
+    int max_tries)
 {
     if (length == 0) {
         out.clear();
         return 0;
+    }
+    if (max_tries < 1){
+        return log_err("Reached maximum tries for API request and failed.");
     }
     std::string range = std::to_string(offset) + "-" +
         std::to_string(offset + length - 1);
     long http_code = 0;
     if (serial_curl_request(url, &out, 0L, nullptr, 0L, &http_code, range.c_str()))
         return 1;
+    if (http_code == 401){
+        log_err("File download failed because of missing authorization, trying to login...");
+        if (studip_login()){
+            return log_err("Login after unauthorized API request failed.");
+        }
+        return download_range(url, offset, length, out, max_tries - 1);
+    }
     if (http_code != 206 && http_code != 200)
         return log_err("Download request failed with status " + std::to_string(http_code));
     return 0;
@@ -953,7 +964,7 @@ static int get_cached_chunk(
 
     std::string data;
     std::string download_url = settings.studip_base_url + "/" + file.download_url;
-    if (download_range(download_url, start, length, data)) {
+    if (download_range(download_url, start, length, data, 2)) {
         std::lock_guard<std::mutex> lock(cache_mutex);
         auto cache_it = file_caches.find(path);
         if (cache_it != file_caches.end()) {
