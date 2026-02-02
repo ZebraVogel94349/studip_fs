@@ -65,6 +65,7 @@ struct folder {
     std::string name;
     folder_type type;
 
+    std::string initial_folders_url;
     std::string folders_url;
     std::string files_url;
 
@@ -821,10 +822,10 @@ int reload_fs_structure(const std::string& path){
             if (it == semester_nodes.end())
                 continue;
 
-                folder course;
-                course.name = c.title;
+            folder course;
+            course.name = c.title;
             course.type = folder_type::COURSE;
-            course.folders_url = c.folders_url;
+            course.initial_folders_url = c.folders_url;
             course.files_url.clear();
             course.children_loaded = 0;
             
@@ -840,11 +841,12 @@ int reload_fs_structure(const std::string& path){
         node->files.clear();
         node->children_loaded = 0;
 
-        std::string root_folders_url;
-        std::string root_files_url;
+        if (node->initial_folders_url == "") {
+            return load_folder_children(*node);
+        }
 
         try {
-            int rc = for_each_paged_item(node->folders_url, [&](const nlohmann::json& item) {
+            int rc = for_each_paged_item(node->initial_folders_url, [&](const nlohmann::json& item) {
                 try {
                     if (item.at("attributes")
                             .at("folder-type")
@@ -852,7 +854,7 @@ int reload_fs_structure(const std::string& path){
                         return 0;
                     }
 
-                    root_folders_url = remove_jsonapi_prefix(
+                    node->folders_url = remove_jsonapi_prefix(
                         item.at("relationships")
                             .at("folders")
                             .at("links")
@@ -860,7 +862,7 @@ int reload_fs_structure(const std::string& path){
                             .get<std::string>()
                     );
 
-                    root_files_url = remove_jsonapi_prefix(
+                    node->files_url = remove_jsonapi_prefix(
                         item.at("relationships")
                             .at("file-refs")
                             .at("links")
@@ -879,18 +881,9 @@ int reload_fs_structure(const std::string& path){
         catch (...) {
             return 1;
         }
-
-        if (!root_folders_url.empty()) {
-            node->folders_url = root_folders_url;
-            node->files_url   = root_files_url;
-            int rc = load_folder_children(*node);
-            return rc;
-        }
-        return 0;
     }
 
-    int rc = load_folder_children(*node);
-    return rc;
+    return load_folder_children(*node);
 }
 
 static const file_entry* find_file_in_folder(
