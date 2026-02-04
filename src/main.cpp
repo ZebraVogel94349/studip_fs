@@ -13,6 +13,7 @@
 #include <shared_mutex>
 #include <thread>
 #include <list>
+#include <optional>
 
 struct Settings {
     std::size_t page_limit = 100;
@@ -312,6 +313,7 @@ int serial_curl_request(
     curl_easy_setopt(curl, CURLOPT_POSTFIELDS, postfields);
     curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE, postfieldsize);
     curl_easy_setopt(curl, CURLOPT_RANGE, range);
+    curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, range ? 0L : 1L);
     if(!post){
         curl_easy_setopt(curl, CURLOPT_HTTPGET, 1L);
     }
@@ -780,7 +782,7 @@ int reload_fs_structure(const std::string& path){
 
         folder personal_files;
         personal_files.name = "Personal Files";
-        personal_files.folders_url = personal_files_route;
+        personal_files.initial_folders_url = personal_files_route;
         personal_files.files_url.clear();
         personal_files.subfolders.clear();
         personal_files.children_loaded = 0; 
@@ -915,7 +917,7 @@ static int download_range(
     long http_code = 0;
     if (serial_curl_request(url, &out, 0L, nullptr, 0L, &http_code, range.c_str()))
         return 1;
-    if (http_code == 401){
+    if (http_code == 302){
         log_err("File download failed because of missing authorization, trying to login...");
         if (studip_login()){
             return log_err("Login after unauthorized API request failed.");
